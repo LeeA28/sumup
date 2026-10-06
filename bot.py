@@ -2,22 +2,25 @@ import os
 from typing import Optional
 
 import discord
+import openai
 from discord import app_commands
 from dotenv import load_dotenv
+
+from summarizer import summarize_transcript
 
 # Load secrets from .env into environment variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
-if not TOKEN or not GUILD_ID:
-    raise SystemExit("Missing DISCORD_TOKEN or DISCORD_GUILD_ID in .env")
+if not TOKEN or not GUILD_ID or not os.getenv("OPENAI_API_KEY"):
+    raise SystemExit("Missing DISCORD_TOKEN, DISCORD_GUILD_ID, or OPENAI_API_KEY in .env")
 
 # The test server, as an object discord.py can sync commands to
 TEST_GUILD = discord.Object(id=int(GUILD_ID))
 
-MAX_MESSAGES = 200      # most messages /summarize will read at once
-PREVIEW_LIMIT = 1800    # Discord messages max out at 2000 characters
+MAX_MESSAGES = 200        # most messages /summarize will read at once
+DISCORD_CHAR_LIMIT = 2000  # Discord's maximum message length
 
 
 class SumUp(discord.Client):
@@ -49,6 +52,20 @@ def format_message(message: discord.Message) -> Optional[str]:
         return None  # e.g. embed-only messages with no text
     time = message.created_at.astimezone().strftime("%I:%M %p")
     return f"[{time}] {message.author.display_name}: {text}"
+
+
+def split_message(text: str, limit: int = DISCORD_CHAR_LIMIT) -> list[str]:
+    """Split text into chunks under Discord's limit, breaking at line ends."""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)  # last line break that fits
+        if cut <= 0:
+            cut = limit  # one very long line: cut it mid-line
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
 
 
 @client.event
@@ -97,13 +114,23 @@ async def summarize(
     lines.reverse()  # oldest first, the way people read a chat
     transcript = "\n".join(lines)
 
-    # Step 2 shows the raw transcript; Step 3 will send it to the LLM instead
-    if len(transcript) > PREVIEW_LIMIT:
-        transcript = "...\n" + transcript[-PREVIEW_LIMIT:]
-    await interaction.followup.send(
-        f"Read {len(lines)} messages:\n```\n{transcript}\n```",
-        ephemeral=True,
-    )
+    try:
+        summary = await summarize_transcript(transcript)
+    except openai.APIError as error:
+        print(f"OpenAI error: {error!r}")  # full details for you, in the terminal
+        await interaction.followup.send(
+            "Sorry, I couldn't reach the summarizer right now. Try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    if not summary:
+        await interaction.followup.send("The summarizer returned nothing. Try again.", ephemeral=True)
+        return
+
+    reply = f"**Σ Summary of the last {len(lines)} messages**\n{summary}"
+    for chunk in split_message(reply):
+        await interaction.followup.send(chunk, ephemeral=True)
 
 
 client.run(TOKEN)

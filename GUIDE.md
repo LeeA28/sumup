@@ -85,3 +85,36 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
   - `client.latency` is the delay between the bot and Discord in seconds, converted to milliseconds.
   - `ephemeral=True` makes the reply visible only to the user who ran it.
 - **`client.run(TOKEN)`:** logs in and keeps the bot running until stopped.
+
+## Step 2: Reading history
+
+### What it does
+
+- `/summarize` reads recent messages in the channel and shows them back as a transcript, visible only to the person who ran it.
+- No AI yet. This step shows exactly what data the bot will later send to the LLM.
+
+### How it works
+
+- **The `count` option:**
+  - `app_commands.Range[int, 1, 200]` makes Discord itself enforce the range in the command menu, so the bot never receives an invalid number.
+  - Defaults to 50 if the user leaves it blank.
+- **Deferring:**
+  - Discord requires a response to a slash command within 3 seconds.
+  - `interaction.response.defer(ephemeral=True, thinking=True)` immediately shows a private "SumUp is thinking..." placeholder.
+  - The real answer is sent later with `interaction.followup.send(...)`, which is allowed for up to 15 minutes.
+- **Reading messages:**
+  - `channel.history(limit=count)` returns messages newest first, so the list is reversed afterwards to read oldest first, like a normal chat.
+  - It is an async iterator (`async for`): messages are fetched from Discord in batches over the network, so the bot awaits each batch instead of freezing.
+  - `limit` counts every message, including skipped ones, so the transcript can have fewer lines than `count`.
+- **Filtering (`format_message`):**
+  - Skips bots, including SumUp itself, so summaries never include bot output.
+  - `clean_content` replaces raw mention codes like `<@123456>` with readable names.
+  - Attachments are kept as `[attachment: filename]` so the summary knows something was shared.
+  - Messages with no text at all (for example embed-only messages) are skipped.
+  - Each line is formatted as `[time] name: text`, the same format used in the API test.
+- **Error handling:** if the bot lacks permission to read the channel, Discord raises `discord.Forbidden`, and the bot replies with a clear message instead of crashing.
+- **Length limit:** Discord messages max out at 2000 characters, so the preview shows only the most recent part of long transcripts. In Step 3 the full transcript goes to the LLM instead.
+
+### Known limitation
+
+- Times use the computer's local time zone (`astimezone()`). On Railway, servers run in UTC, so this will need revisiting before deployment.

@@ -159,3 +159,71 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 ### Known limitations
 
 - No chunking for very long conversations yet. At the 200-message cap, a typical chat is a few thousand tokens, well within the model's limits, but 200 extremely long messages could be large. Revisit if needed.
+
+## Step 4: Catch-up ("what did I miss")
+
+### What it does
+
+- `/catchup` summarizes what a user missed in the channel, with no setup needed.
+- `/catchup since:<time>` lets the user pick the exact starting point.
+- `/timezone` saves the user's time zone so clock times and dates work.
+
+### Design: where does "what you missed" start?
+
+- **The ideal signal isn't available.** Discord's "new messages since..." banner comes from each user's read state, which Discord only shares with that user's own app, never with bots (for privacy).
+- **Approximation, using the most recent of:**
+  - The user's last `/catchup` in that channel.
+  - The user's last message in that channel. The user was clearly present then.
+- **Grace period:** the user's own messages from the last 10 minutes are ignored when finding the start. Otherwise typing "what did I miss?" and then running `/catchup` would catch up on nothing.
+- **No signal at all** (never posted, never caught up): fall back to the last 50 messages and suggest using `since`.
+- **Finding the start without tracking every message:** instead of storing every user's last message (which would be lost on restart), `/catchup` reads history newest first and stops at the first message by the user or at the last catch-up time. Only the catch-up time needs to be stored.
+- The catch-up time is saved only after a successful summary, so a failed attempt doesn't skip messages.
+
+### The `since` option
+
+- Accepted formats:
+  - Relative: `2h`, `30m`, `1d 3h`, `2 hours ago`. These work without a time zone.
+  - Clock times: `4:00 PM`, `4pm`, `16:00`, optionally with `today` or `yesterday`.
+  - Dates with month names: `Sep 22 6:23 PM`, `6:23 PM on September 22, 2026` (the format of Discord's banner).
+- Rules:
+  - Numeric dates like `9/10` are rejected because they are ambiguous (Sept 10 or Oct 9).
+  - Clock times and dates require a saved time zone; relative times don't.
+  - No AM/PM (`4:00`): the most recent past 4:00, AM or PM.
+  - No year: the most recent past occurrence of that date.
+  - Future times are rejected.
+- **How the parser works (`timeutils.py`):** it pulls out the date part and the time part, lists every moment the user could mean (for example 4 AM and 4 PM, today and yesterday), drops the ones in the future, and picks the most recent remaining one.
+- **Why a custom parser instead of the `dateparser` library:** `dateparser` accepts far more formats than wanted (including ambiguous numeric dates) and its guesses are harder to predict and explain. The custom parser accepts exactly the agreed formats with clear rules, and each error message tells the user what to type instead.
+
+### Autocomplete
+
+- Discord slash command inputs can't show placeholder text, so autocomplete fills that role.
+- With an empty box, it shows example inputs (`2h`, `4:00 PM`, `Sep 22 6:23 PM`).
+- While typing, it shows how SumUp read the input, like "→ Yesterday at 4:00 PM (Toronto)", or a short error explaining what to fix.
+- Autocomplete must answer within 3 seconds, so it only parses text and never calls Discord or the LLM.
+
+### Time zones
+
+- Discord doesn't tell bots a user's time zone, so `/timezone` asks once, with autocomplete over city names (for example "Toronto (America/Toronto), now 4:12 PM").
+- Zones use IANA names like `America/Toronto` and Python's built-in `zoneinfo`, which handles daylight saving time automatically.
+- Windows doesn't ship the IANA time zone database, so the `tzdata` package provides it.
+- Without a time zone set, transcript times are shown in UTC and labeled "UTC" so they are never wrong.
+- **Discord timestamps:** the catch-up header uses `<t:UNIX:f>` markup, which Discord displays in each viewer's own local time. No time zone needed for that part.
+
+### Limits
+
+- At most 500 messages per catch-up.
+  - Cost at the cap: about 25 tokens per message × 500 = 12,500 input tokens, about $0.0014 per catch-up with Luna.
+  - Speed: Discord returns at most 100 messages per request, so 500 messages is 5 requests.
+  - Quality: very long inputs make models miss details, and thousands of messages can't fit in a few bullets.
+- When the cap is hit, the reply says so and covers the most recent 500.
+- Catch-ups over 200 messages allow up to 8 bullets instead of 6.
+- To detect the cap, 501 messages are fetched: if 501 come back, the user missed more than 500.
+
+### New files
+
+- `timeutils.py`: parsing `since`, time zone search, and time formatting.
+- `state.py`: per-user data (time zones, last catch-up times). Kept in memory for now, so it resets on restart; Step 6 swaps the inside of its functions for a database without changing how the rest of the code calls them.
+
+### Known limitations
+
+- Time zones and catch-up times reset when the bot restarts (fixed in Step 6).

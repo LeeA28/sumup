@@ -8,7 +8,8 @@ from datetime import datetime
 from typing import Optional
 
 _timezones: dict[int, str] = {}                        # user ID -> "America/Toronto"
-_last_catchups: dict[tuple[int, int], datetime] = {}   # (user ID, channel ID) -> UTC time
+_modes: dict[int, str] = {}                            # user ID -> "action"
+_last_sumups: dict[tuple[int, int], datetime] = {}   # (user ID, channel ID) -> UTC time
 
 
 def get_timezone(user_id: int) -> Optional[str]:
@@ -19,9 +20,17 @@ def set_timezone(user_id: int, zone: str) -> None:
     _timezones[user_id] = zone
 
 
-def get_last_catchup(user_id: int, channel_id: int) -> Optional[datetime]:
-    return _last_catchups.get((user_id, channel_id))
+def get_last_sumup(user_id: int, channel_id: int) -> Optional[datetime]:
+    return _last_sumups.get((user_id, channel_id))
 
 
-def set_last_catchup(user_id: int, channel_id: int, when: datetime) -> None:
-    _last_catchups[(user_id, channel_id)] = when
+def set_last_sumup(user_id: int, channel_id: int, when: datetime) -> None:
+    _last_sumups[(user_id, channel_id)] = when
+
+
+def get_mode(user_id: int) -> Optional[str]:
+    return _modes.get(user_id)
+
+
+def set_mode(user_id: int, mode: str) -> None:
+    _modes[user_id] = mode

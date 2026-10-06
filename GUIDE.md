@@ -227,3 +227,59 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 ### Known limitations
 
 - Time zones and catch-up times reset when the bot restarts (fixed in Step 6).
+
+## Step 5: Summary modes
+
+### What it does
+
+- Four summary styles:
+  - **Bullets** (default): 3 to 6 bullets (up to 8 for big catch-ups) on decisions, commitments, and open questions.
+  - **Brief:** a 1 to 2 sentence TL;DR.
+  - **Detailed:** grouped by topic, with who said what and a "Still open" section.
+  - **Action items:** only tasks as "name: task", plus open questions, or "No action items."
+- `/summarize` and `/catchup` have a `mode` dropdown for a one-time choice.
+- `/mode` sets a user's default style; running it with no choice shows the current default.
+- The summary header names the mode, for example "Σ Catch-up (Action items): 23 messages since...".
+
+### How it works
+
+- **Shared base prompt plus a per-mode format (`summarizer.py`):**
+  - `BASE_PROMPT` holds the rules every mode follows: don't invent details, use usernames as written, skip tangents, and the prompt injection defense.
+  - `FORMATS` holds only the part that changes: how the output should look.
+  - `build_instructions(mode)` combines them.
+  - **Why:** the accuracy rules exist in exactly one place, so editing one mode can never weaken another mode's rules.
+- **Choosing the mode:** the mode picked in the command wins; otherwise the user's saved default; otherwise Bullets (`resolve_mode` in `bot.py`).
+- **Dropdowns with `app_commands.choices`:** a fixed list of options in Discord's menu, so users can't mistype a mode. Each choice has a label users see ("Action items") and a value the code uses ("action").
+  - Different from autocomplete: autocomplete suggests while the user types and still allows any text; choices allow only listed values.
+- **Saved default:** stored in `state.py` alongside time zones (in memory until Step 6).
+
+### Decision: prompts not pre-tested
+
+- The new mode prompts were written but not tested in the Playground before coding. They are being judged from real use instead and can be adjusted in `FORMATS` without touching any other code.
+
+## Merging into one command: `/sumup`
+
+### What changed
+
+- `/summarize` (last N messages) and `/catchup` (what you missed) were replaced by a single `/sumup` command.
+- The `count` option was dropped; `since` covers choosing a range manually.
+- Commands now: `/sumup`, `/mode`, `/timezone`, `/ping`.
+- Sections above that mention `/summarize` or `/catchup` describe how the bot worked before this change; the logic now lives in `/sumup`.
+
+### Why
+
+- Two commands made users decide which one fit their situation. One command that picks the right behavior automatically is simpler, and naming it after the bot makes it easy to remember.
+
+### How `/sumup` decides what to cover
+
+- **`since` given:** everything since that time, up to 500 messages.
+- **Default:** everything since the more recent of the user's last `/sumup` in the channel or their last message (outside the 10-minute grace period).
+- **No start point within the last 500 messages** (a new member, someone who only reads, or someone away a long time): the last 500 messages, so newcomers get the backstory.
+  - This merged two earlier cases ("never here" and "missed more than 500") into one: read up to 500 messages and stop.
+- **Small channel and first-time user:** the whole channel.
+- A short note under the header explains whichever case applied, using Discord's `-#` subtext formatting.
+
+### Other details
+
+- `state.py` functions were renamed from `last_catchup` to `last_sumup`.
+- Removed commands disappear from Discord at the next sync, which happens at bot startup.

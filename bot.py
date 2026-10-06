@@ -9,7 +9,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 import state
-from summarizer import summarize_transcript
+from summarizer import DEFAULT_MODE, MODES, summarize_transcript
 from timeutils import (
     ALL_ZONES,
     SinceError,
@@ -33,12 +33,13 @@ if not ALL_ZONES:
 # The test server, as an object discord.py can sync commands to
 TEST_GUILD = discord.Object(id=int(GUILD_ID))
 
-MAX_MESSAGES = 200         # most messages /summarize will read at once
-CATCHUP_CAP = 500          # most messages /catchup will read at once
-FALLBACK_COUNT = 50        # used when SumUp can't tell when someone was last here
-BIG_CATCHUP = 200          # above this many messages, allow more bullets
+MESSAGE_CAP = 500          # most messages /sumup will read at once
+BIG_SUMMARY = 200          # above this many messages, allow more bullets
 OWN_MESSAGE_GRACE = timedelta(minutes=10)  # ignore your own very recent messages
 DISCORD_CHAR_LIMIT = 2000  # Discord's maximum message length
+
+# Dropdown options for picking a mode: label shown to users, key used in code
+MODE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in MODES.items()]
 
 
 class SumUp(discord.Client):
@@ -61,6 +62,13 @@ client = SumUp()
 
 
 # --- Helpers ------------------------------------------------------------------
+
+def resolve_mode(user_id: int, choice: Optional[app_commands.Choice[str]]) -> str:
+    """The mode picked for this command, else the user's default, else bullets."""
+    if choice:
+        return choice.value
+    return state.get_mode(user_id) or DEFAULT_MODE
+
 
 def user_zone(user_id: int) -> Optional[ZoneInfo]:
     """The user's saved time zone, or None if they haven't set one."""
@@ -104,11 +112,13 @@ def discord_time(dt: datetime) -> str:
     return f"<t:{int(dt.timestamp())}:f>"
 
 
-async def send_summary(interaction: discord.Interaction, header: str, lines: list[str]) -> bool:
+async def send_summary(
+    interaction: discord.Interaction, header: str, lines: list[str], mode: str
+) -> bool:
     """Summarize transcript lines and send the result. Returns True on success."""
-    max_bullets = 8 if len(lines) > BIG_CATCHUP else 6
+    max_bullets = 8 if len(lines) > BIG_SUMMARY else 6
     try:
-        summary = await summarize_transcript("\n".join(lines), max_bullets=max_bullets)
+        summary = await summarize_transcript("\n".join(lines), mode=mode, max_bullets=max_bullets)
     except openai.APIError as error:
         print(f"OpenAI error: {error!r}")  # full details for you, in the terminal
         await interaction.followup.send(
@@ -144,42 +154,25 @@ async def ping(interaction: discord.Interaction):
     )
 
 
-@client.tree.command(name="summarize", description="Summarize recent messages in this channel")
-@app_commands.describe(count=f"How many recent messages to read (1-{MAX_MESSAGES})")
-async def summarize(
+@client.tree.command(name="sumup", description="Summarize what you missed in this channel")
+@app_commands.describe(
+    since="When you were last here, like 2h, 4:00 PM, or Sep 22 6:23 PM",
+    mode="Summary style for this one summary (default: your /mode setting)",
+)
+@app_commands.choices(mode=MODE_CHOICES)
+async def sumup(
     interaction: discord.Interaction,
-    count: app_commands.Range[int, 1, MAX_MESSAGES] = 50,
+    since: Optional[str] = None,
+    mode: Optional[app_commands.Choice[str]] = None,
 ):
     # Reply within 3 seconds with a private "thinking..." placeholder
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    tz = user_zone(interaction.user.id)
-
-    try:
-        # history() returns newest first
-        messages = [m async for m in interaction.channel.history(limit=count)]
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "I don't have permission to read this channel's history.", ephemeral=True
-        )
-        return
-
-    lines = [line for m in reversed(messages) if (line := format_message(m, tz))]
-    if not lines:
-        await interaction.followup.send("No messages to summarize here.", ephemeral=True)
-        return
-
-    await send_summary(interaction, f"**Σ Summary of the last {len(lines)} messages**", lines)
-
-
-@client.tree.command(name="catchup", description="Summarize what you missed in this channel")
-@app_commands.describe(since="When you were last here, like 2h, 4:00 PM, or Sep 22 6:23 PM")
-async def catchup(interaction: discord.Interaction, since: Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
     now = discord.utils.utcnow()
     user = interaction.user
     channel = interaction.channel
     tz = user_zone(user.id)
-    note = ""
+    last_sumup = state.get_last_sumup(user.id, channel.id)
+    start = None
 
     try:
         if since:
@@ -191,58 +184,66 @@ async def catchup(interaction: discord.Interaction, since: Optional[str] = None)
                 return
             # Newest first, stopping at the start time; one extra to detect the cap
             messages = [
-                m async for m in channel.history(limit=CATCHUP_CAP + 1, after=start, oldest_first=False)
+                m async for m in channel.history(limit=MESSAGE_CAP + 1, after=start, oldest_first=False)
             ]
         else:
-            # Work backwards until we reach the user's last /catchup here
+            # Work backwards until we reach the user's last /sumup here
             # or their last message (ignoring messages from the last few minutes,
             # like "what did I miss?")
-            last_catchup = state.get_last_catchup(user.id, channel.id)
-            start = None
             messages = []
-            async for m in channel.history(limit=CATCHUP_CAP + 1):
-                if last_catchup and m.created_at <= last_catchup:
-                    start = last_catchup
+            async for m in channel.history(limit=MESSAGE_CAP + 1):
+                if last_sumup and m.created_at <= last_sumup:
+                    start = last_sumup
                     break
                 if m.author.id == user.id and m.created_at <= now - OWN_MESSAGE_GRACE:
                     start = m.created_at
                     break
                 messages.append(m)
-
-            if start is None and last_catchup is None:
-                # No sign of when they were last here: fall back to recent messages
-                messages = messages[:FALLBACK_COUNT]
-                note = (
-                    f"\n-# I couldn't tell when you were last here, so this covers the last "
-                    f"{FALLBACK_COUNT} messages. Use `since` to pick a time."
-                )
     except discord.Forbidden:
         await interaction.followup.send(
             "I don't have permission to read this channel's history.", ephemeral=True
         )
         return
 
-    if len(messages) > CATCHUP_CAP:
-        messages = messages[:CATCHUP_CAP]
+    # Explain to the user what range this summary covers, when it isn't obvious
+    note = ""
+    capped = len(messages) > MESSAGE_CAP
+    if capped:
+        messages = messages[:MESSAGE_CAP]
+        if since or last_sumup:
+            note = (
+                f"\n-# You missed more than {MESSAGE_CAP} messages, so this covers the most "
+                f"recent {MESSAGE_CAP}."
+            )
+        else:
+            note = (
+                f"\n-# This is your first SumUp here, so this covers the last {MESSAGE_CAP} "
+                f"messages. Next time it'll pick up where you left off."
+            )
+    elif start is None and not last_sumup:
         note = (
-            f"\n-# You missed more than {CATCHUP_CAP} messages, so this covers the most recent "
-            f"{CATCHUP_CAP}."
+            "\n-# This is your first SumUp here, so this covers the whole channel. "
+            "Next time it'll pick up where you left off."
         )
 
     lines = [line for m in reversed(messages) if (line := format_message(m, tz))]
     if not lines:
-        state.set_last_catchup(user.id, channel.id, now)
+        state.set_last_sumup(user.id, channel.id, now)
         await interaction.followup.send("You're all caught up! No new messages.", ephemeral=True)
         return
 
-    # If we didn't find a start point, the summary starts at the oldest message read
-    shown_start = start if start and not note else messages[-1].created_at
-    header = f"**Σ Catch-up: {len(lines)} messages since {discord_time(shown_start)}**{note}"
-    if await send_summary(interaction, header, lines):
-        state.set_last_catchup(user.id, channel.id, now)
+    # Without a known start point, the summary starts at the oldest message read
+    shown_start = start if start and not capped else messages[-1].created_at
+    mode_key = resolve_mode(user.id, mode)
+    header = (
+        f"**Σ SumUp ({MODES[mode_key]}): {len(lines)} messages since "
+        f"{discord_time(shown_start)}**{note}"
+    )
+    if await send_summary(interaction, header, lines, mode_key):
+        state.set_last_sumup(user.id, channel.id, now)
 
 
-@catchup.autocomplete("since")
+@sumup.autocomplete("since")
 async def since_autocomplete(interaction: discord.Interaction, current: str):
     """Show how SumUp reads the `since` text while the user types it."""
     if not current.strip():
@@ -258,6 +259,28 @@ async def since_autocomplete(interaction: discord.Interaction, current: str):
     except SinceError as error:
         label = str(error)
     return [app_commands.Choice(name=label[:100], value=current[:100])]
+
+
+@client.tree.command(name="mode", description="Set your default summary style")
+@app_commands.describe(mode="Your default style (leave empty to see your current one)")
+@app_commands.choices(mode=MODE_CHOICES)
+async def set_mode(
+    interaction: discord.Interaction,
+    mode: Optional[app_commands.Choice[str]] = None,
+):
+    if mode is None:
+        current = MODES[state.get_mode(interaction.user.id) or DEFAULT_MODE]
+        await interaction.response.send_message(
+            f"Your default mode is **{current}**. Pick a mode in this command to change it.",
+            ephemeral=True,
+        )
+        return
+    state.set_mode(interaction.user.id, mode.value)
+    await interaction.response.send_message(
+        f"Your default mode is now **{mode.name}**. You can still pick a different mode "
+        f"for one summary with the `mode` option.",
+        ephemeral=True,
+    )
 
 
 @client.tree.command(name="timezone", description="Set your time zone so SumUp can read clock times")

@@ -1,4 +1,4 @@
-"""Reading the /catchup `since` option, and time zone helpers."""
+"""Reading the /sumup `since` option, and time zone helpers."""
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional

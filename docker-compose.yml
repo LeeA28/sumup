@@ -1,0 +1,15 @@
+# Local Postgres for development. Start it with: docker compose up -d
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sumup
+      POSTGRES_PASSWORD: sumup_dev   # local-only password, never used in production
+      POSTGRES_DB: sumup
+    ports:
+      - "127.0.0.1:5432:5432"        # reachable from this PC only
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # data survives container restarts
+
+volumes:
+  pgdata:

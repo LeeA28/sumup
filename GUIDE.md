@@ -283,3 +283,61 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 
 - `state.py` functions were renamed from `last_catchup` to `last_sumup`.
 - Removed commands disappear from Discord at the next sync, which happens at bot startup.
+
+## Step 6: Persistence with Postgres
+
+### What it does
+
+- Time zones, default modes, and last `/sumup` times are saved in Postgres, so they survive bot restarts and redeploys.
+
+### Why Postgres (over SQLite)
+
+- The goal is for SumUp to eventually serve many servers and users.
+- Postgres is a full database server: it handles many simultaneous connections, works with more than one copy of the bot, and Railway provides managed backups.
+- SQLite (a single database file) would have been simpler and enough for a small bot, but it only suits one running copy, and on Railway the file would need a persistent volume.
+- Postgres is also an industry-standard database, which adds hands-on experience to talk about.
+
+### Local development with Docker
+
+- **Why Docker:** a local Postgres runs in a container defined by `docker-compose.yml`, committed to the repo. Anyone who clones SumUp runs one command and gets the same database. It's free, works offline, uses no hosting credits, and keeps dev data separate from production.
+- **Concepts:**
+  - **Image:** a packaged template (here, `postgres:17` from Docker Hub).
+  - **Container:** a running copy of an image, isolated from the rest of the PC.
+  - **Volume:** storage that lives outside the container (`pgdata`), so the data survives when the container is stopped or recreated.
+  - **Docker Compose:** describes containers in one file; `docker compose up -d` starts them in the background.
+  - **Client and daemon:** the `docker` command is a client that sends instructions to the daemon (the engine), which runs inside WSL2 on Windows.
+- **Port mapping `127.0.0.1:5432:5432`:** the container's Postgres port is reachable from this PC only, not from other devices on the network.
+- **The password `sumup_dev`** is local-only. Production uses Railway's generated credentials.
+- **Version:** `postgres:17`, to be matched to Railway's Postgres version in Step 8.
+- **Windows setup notes:** Docker Desktop needs WSL2 and the Virtual Machine Platform Windows feature (enabled from an administrator PowerShell, followed by a full restart).
+
+### Configuration
+
+- `.env` has a new `DATABASE_URL`, a connection string in the form `postgresql://user:password@host:port/database`.
+- Locally it points at the Docker container; on Railway it will point at the production database. The code doesn't change, only the environment variable.
+
+### Schema
+
+- `user_settings`: `user_id` (primary key), `timezone`, `mode`. A NULL column means "not set," and the bot falls back to its defaults.
+- `last_sumups`: `user_id`, `channel_id`, `last_sumup_at`, with a composite primary key on (`user_id`, `channel_id`), since each user has one time per channel.
+- **`BIGINT` for IDs:** Discord IDs (snowflakes) are too big for a regular 32-bit `INTEGER` but fit in a 64-bit `BIGINT`.
+- **`TIMESTAMPTZ`:** stores an exact moment in time; the driver returns time zone-aware UTC datetimes, matching Discord's `created_at`.
+- Tables are created at startup with `CREATE TABLE IF NOT EXISTS`, which is safe to run every time. If the schema changes later, the plan is to switch to versioned migration files.
+- No message content is ever stored, only IDs, settings, and timestamps.
+
+### How the code works (`state.py`)
+
+- **Driver: `asyncpg`.** Async, so the bot keeps serving other commands while waiting on the database.
+- **Connection pool:** a small set of connections (1 to 5) opened at startup and reused, instead of opening a new connection for every command. Opening a connection is slow (network handshake, authentication), so reuse matters as usage grows.
+- **Parameterized queries (`$1`, `$2`):** values are sent separately from the SQL text, which prevents SQL injection.
+- **Upserts:** `INSERT ... ON CONFLICT (...) DO UPDATE SET ...` creates the row if it's new or updates it if it exists, in one query. Setting the mode only updates the `mode` column, leaving the time zone untouched.
+- **Same function names as before:** `bot.py` still calls `get_timezone`, `set_last_sumup`, and so on. The only change in `bot.py` is adding `await`, because the functions are now async. Designing `state.py` as a separate layer in Step 4 made this swap small.
+- **Lifecycle:** `setup_hook` opens the pool before commands sync; the bot's `close()` closes the pool on shutdown (for example on Ctrl + C).
+
+### Testing
+
+- `state.py` was tested against a real Postgres server: tables created twice safely, defaults return None, upserts update one column without touching the other, 19-digit Discord IDs stored correctly, and timestamps returned as UTC.
+
+### Known limitations
+
+- `/timezone` and `/sumup` autocomplete look up the user's time zone on each keystroke, one small database query each. Fine at current scale; a short in-memory cache could reduce this later.

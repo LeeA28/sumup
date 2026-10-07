@@ -24,9 +24,12 @@ from timeutils import (
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not TOKEN or not GUILD_ID or not os.getenv("OPENAI_API_KEY"):
-    raise SystemExit("Missing DISCORD_TOKEN, DISCORD_GUILD_ID, or OPENAI_API_KEY in .env")
+if not TOKEN or not GUILD_ID or not os.getenv("OPENAI_API_KEY") or not DATABASE_URL:
+    raise SystemExit(
+        "Missing DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY, or DATABASE_URL in .env"
+    )
 if not ALL_ZONES:
     raise SystemExit("No time zone data found. Run: pip install tzdata")
 
@@ -52,10 +55,18 @@ class SumUp(discord.Client):
 
     async def setup_hook(self):
         # Runs once at startup, before the bot connects.
+        # Connect to the database first, so commands can use it right away.
+        await state.init(DATABASE_URL)
+        print("Connected to the database")
         # Syncing to one server makes command changes appear instantly.
         self.tree.copy_global_to(guild=TEST_GUILD)
         synced = await self.tree.sync(guild=TEST_GUILD)
         print(f"Synced {len(synced)} command(s) to the test server")
+
+    async def close(self):
+        # Runs on shutdown (like Ctrl + C): close database connections cleanly
+        await state.close()
+        await super().close()
 
 
 client = SumUp()
@@ -63,16 +74,16 @@ client = SumUp()
 
 # --- Helpers ------------------------------------------------------------------
 
-def resolve_mode(user_id: int, choice: Optional[app_commands.Choice[str]]) -> str:
+async def resolve_mode(user_id: int, choice: Optional[app_commands.Choice[str]]) -> str:
     """The mode picked for this command, else the user's default, else bullets."""
     if choice:
         return choice.value
-    return state.get_mode(user_id) or DEFAULT_MODE
+    return await state.get_mode(user_id) or DEFAULT_MODE
 
 
-def user_zone(user_id: int) -> Optional[ZoneInfo]:
+async def user_zone(user_id: int) -> Optional[ZoneInfo]:
     """The user's saved time zone, or None if they haven't set one."""
-    zone = state.get_timezone(user_id)
+    zone = await state.get_timezone(user_id)
     return ZoneInfo(zone) if zone else None
 
 
@@ -170,8 +181,8 @@ async def sumup(
     now = discord.utils.utcnow()
     user = interaction.user
     channel = interaction.channel
-    tz = user_zone(user.id)
-    last_sumup = state.get_last_sumup(user.id, channel.id)
+    tz = await user_zone(user.id)
+    last_sumup = await state.get_last_sumup(user.id, channel.id)
     start = None
 
     try:
@@ -228,19 +239,19 @@ async def sumup(
 
     lines = [line for m in reversed(messages) if (line := format_message(m, tz))]
     if not lines:
-        state.set_last_sumup(user.id, channel.id, now)
+        await state.set_last_sumup(user.id, channel.id, now)
         await interaction.followup.send("You're all caught up! No new messages.", ephemeral=True)
         return
 
     # Without a known start point, the summary starts at the oldest message read
     shown_start = start if start and not capped else messages[-1].created_at
-    mode_key = resolve_mode(user.id, mode)
+    mode_key = await resolve_mode(user.id, mode)
     header = (
         f"**Σ SumUp ({MODES[mode_key]}): {len(lines)} messages since "
         f"{discord_time(shown_start)}**{note}"
     )
     if await send_summary(interaction, header, lines, mode_key):
-        state.set_last_sumup(user.id, channel.id, now)
+        await state.set_last_sumup(user.id, channel.id, now)
 
 
 @sumup.autocomplete("since")
@@ -253,7 +264,7 @@ async def since_autocomplete(interaction: discord.Interaction, current: str):
             app_commands.Choice(name="Example: Sep 22 6:23 PM", value="Sep 22 6:23 PM"),
         ]
     now = discord.utils.utcnow()
-    tz = user_zone(interaction.user.id)
+    tz = await user_zone(interaction.user.id)
     try:
         label = "→ " + describe_since(parse_since(current, now, tz), now, tz)
     except SinceError as error:
@@ -269,13 +280,13 @@ async def set_mode(
     mode: Optional[app_commands.Choice[str]] = None,
 ):
     if mode is None:
-        current = MODES[state.get_mode(interaction.user.id) or DEFAULT_MODE]
+        current = MODES[await state.get_mode(interaction.user.id) or DEFAULT_MODE]
         await interaction.response.send_message(
             f"Your default mode is **{current}**. Pick a mode in this command to change it.",
             ephemeral=True,
         )
         return
-    state.set_mode(interaction.user.id, mode.value)
+    await state.set_mode(interaction.user.id, mode.value)
     await interaction.response.send_message(
         f"Your default mode is now **{mode.name}**. You can still pick a different mode "
         f"for one summary with the `mode` option.",
@@ -292,7 +303,7 @@ async def set_timezone(interaction: discord.Interaction, zone: str):
             ephemeral=True,
         )
         return
-    state.set_timezone(interaction.user.id, zone)
+    await state.set_timezone(interaction.user.id, zone)
     local_now = discord.utils.utcnow().astimezone(ZoneInfo(zone))
     await interaction.response.send_message(
         f"Time zone set to **{zone}**. It's {format_clock(local_now)} there right now.",

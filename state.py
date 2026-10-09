@@ -4,7 +4,7 @@ bot.py only calls the functions below, so it doesn't need to know
 any SQL. Every function is async: database calls go over the network,
 and awaiting them lets the bot keep serving other users meanwhile.
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 import asyncpg
@@ -24,6 +24,13 @@ CREATE TABLE IF NOT EXISTS last_sumups (
     channel_id     BIGINT NOT NULL,
     last_sumup_at  TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (user_id, channel_id)   -- one time per user per channel
+);
+
+CREATE TABLE IF NOT EXISTS daily_usage (
+    user_id  BIGINT NOT NULL,
+    day      DATE NOT NULL,        -- Toronto date the usage counts toward
+    count    INTEGER NOT NULL,     -- successful summaries that day
+    PRIMARY KEY (user_id, day)
 );
 """
 
@@ -90,3 +97,43 @@ async def set_last_sumup(user_id: int, channel_id: int, when: datetime) -> None:
         """,
         user_id, channel_id, when,
     )
+
+
+# --- Daily usage limit ----------------------------------------------------------
+
+async def get_usage(user_id: int, day: date) -> int:
+    """How many successful summaries the user has had on this day."""
+    count = await _pool.fetchval(
+        "SELECT count FROM daily_usage WHERE user_id = $1 AND day = $2", user_id, day
+    )
+    return count or 0
+
+
+async def add_usage(user_id: int, day: date) -> None:
+    """Count one successful summary. The +1 happens inside Postgres, so two
+    commands finishing at the same moment can't overwrite each other."""
+    await _pool.execute(
+        """
+        INSERT INTO daily_usage (user_id, day, count) VALUES ($1, $2, 1)
+        ON CONFLICT (user_id, day) DO UPDATE SET count = daily_usage.count + 1
+        """,
+        user_id, day,
+    )
+
+
+async def prune_usage(before: date) -> None:
+    """Delete usage rows older than `before`, so the table doesn't grow forever."""
+    await _pool.execute("DELETE FROM daily_usage WHERE day < $1", before)
+
+
+# --- /forget --------------------------------------------------------------------
+
+async def forget_user(user_id: int) -> None:
+    """Delete everything stored about a user except today's usage count.
+
+    Both deletes run in one transaction: either both happen or neither does.
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM user_settings WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM last_sumups WHERE user_id = $1", user_id)

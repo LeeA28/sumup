@@ -341,3 +341,76 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 ### Known limitations
 
 - `/timezone` and `/sumup` autocomplete look up the user's time zone on each keystroke, one small database query each. Fine at current scale; a short in-memory cache could reduce this later.
+
+## Step 7: Polish
+
+### Limits
+
+- **Why:** every summary costs money (an OpenAI call), so a public bot needs protection from spam and runaway costs.
+- **30-second cooldown per user:**
+  - Stored in memory (`_cooldowns`), since losing a 30-second timer on restart doesn't matter.
+  - Uses `time.monotonic()`, a clock that only moves forward, so a system clock change can't break it.
+  - Starts when a `/sumup` begins, so double-clicking can't start two summaries at once.
+  - Removed again if nothing was summarized (a typo in `since`, "all caught up," a permission problem, or a summarizer error), so users aren't penalized for things that cost nothing.
+- **50 summaries per user per day:**
+  - Stored in Postgres (`daily_usage` table: user, date, count), so restarts can't reset it.
+  - Resets at midnight Toronto time (`America/Toronto`, which follows daylight saving automatically), the same moment for every user. Chosen over a rolling 24-hour window for simplicity: one row per user per day.
+  - The date a summary counts toward is the Toronto date (`limit_day`), and the reset countdown points at the next Toronto midnight (`next_reset`).
+  - Only successful summaries count.
+  - The +1 happens inside the database (`count = daily_usage.count + 1`) so two commands finishing at the same moment can't overwrite each other's count. This avoids a race condition.
+  - The "limit reached" message uses Discord's relative timestamp (`<t:UNIX:R>`), shown as a live countdown like "in 3 hours."
+  - Rows older than 3 days are deleted by a background task (`tasks.loop(hours=24)`) that also runs at startup.
+
+### `/forget`
+
+- Deletes the user's settings and last-`/sumup` times in one **transaction**: both deletes happen, or neither does.
+- **Confirm / Cancel buttons** (`discord.ui.View`):
+  - `interaction_check` makes sure only the person who ran `/forget` can press them.
+  - The buttons expire after 60 seconds, and the message updates to say nothing was deleted.
+- **Does not reset the daily count.** Otherwise `/forget` would be a way around the 50-per-day limit. The count holds only a user ID, a date, and a number, and is deleted automatically within a few days.
+
+### Servers only
+
+- `/sumup` uses `@app_commands.guild_only()`, so Discord doesn't offer it in DMs. DMs with a bot are short, so summarizing them adds little.
+- `/mode`, `/timezone`, `/forget`, and `/ping` still work in DMs, since they're about the user, not a channel.
+
+### Refactoring `/sumup`
+
+- The command was split into small helpers, each with one job:
+  - `check_limits`: cooldown and daily limit.
+  - `fetch_since` / `fetch_missed`: which messages to read.
+  - `Window`: a `dataclass` bundling the messages, the start point, and whether the 500 cap was hit.
+  - `range_note`: the explanation line under the header.
+- The command itself now reads top to bottom as a list of steps.
+
+### Global error handler
+
+- `@client.tree.error` catches any error a command didn't handle itself, such as the database being unreachable.
+- The user gets a friendly message instead of a command that silently fails; the full error is printed for debugging.
+- It uses `followup` if the command already deferred, or a normal response if not.
+
+## Step 8: Deploy and document
+
+### Development vs production
+
+- `DISCORD_GUILD_ID` is now optional:
+  - **Set (on the dev PC):** commands sync to the test server and update instantly.
+  - **Not set (on Railway):** commands sync globally, so SumUp works in every server it joins. Global changes can take up to an hour to appear.
+- On Railway there is no `.env` file. The same values are set as Railway environment variables; `load_dotenv()` simply finds nothing and the code reads them the same way.
+
+### Railway
+
+- **Builder:** Railway's Railpack detects Python from `requirements.txt`, reads the Python version from `.python-version` (pinned to 3.13 to match development), and automatically runs `bot.py` (it checks for `main.py`, `app.py`, `start.py`, then `bot.py`).
+- **Database:** a Railway Postgres service. The bot's `DATABASE_URL` uses Railway's reference variable `${{Postgres.DATABASE_URL}}`, which points at the database over Railway's private network.
+- **Separate secrets:** a production OpenAI key separate from the 30-day dev key, so either can be revoked without affecting the other.
+- **Plan:** started on the Trial (a one-time $5 credit), with the Hobby plan ($5/month including $5 of usage) as the next step.
+
+### Going public
+
+- **Public Bot** must be on (Developer Portal → Bot) so others can invite SumUp.
+- **Invite link:** OAuth2 → URL Generator with the `bot` and `applications.commands` scopes and View Channels, Send Messages, Read Message History, and Embed Links permissions.
+- **Scaling note:** Discord requires verification for bots in 100 or more servers, including approval to keep using the privileged Message Content intent that SumUp depends on.
+
+### README
+
+- `README.md` explains what SumUp does, the commands, how it works, the design decisions, the tech stack, and how to run it locally. It's the page linked from the resume.

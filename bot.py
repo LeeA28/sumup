@@ -1,4 +1,6 @@
 import os
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -6,6 +8,7 @@ from zoneinfo import ZoneInfo
 import discord
 import openai
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 import state
@@ -20,26 +23,29 @@ from timeutils import (
     zone_city,
 )
 
-# Load secrets from .env into environment variables
+# Load secrets from .env into environment variables.
+# On Railway there's no .env file; the same names are set as environment variables.
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional: set for development only
 
-if not TOKEN or not GUILD_ID or not os.getenv("OPENAI_API_KEY") or not DATABASE_URL:
-    raise SystemExit(
-        "Missing DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY, or DATABASE_URL in .env"
-    )
+if not TOKEN or not os.getenv("OPENAI_API_KEY") or not DATABASE_URL:
+    raise SystemExit("Missing DISCORD_TOKEN, OPENAI_API_KEY, or DATABASE_URL")
 if not ALL_ZONES:
     raise SystemExit("No time zone data found. Run: pip install tzdata")
 
-# The test server, as an object discord.py can sync commands to
-TEST_GUILD = discord.Object(id=int(GUILD_ID))
+# The test server, if one is set
+TEST_GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
 MESSAGE_CAP = 500          # most messages /sumup will read at once
 BIG_SUMMARY = 200          # above this many messages, allow more bullets
 OWN_MESSAGE_GRACE = timedelta(minutes=10)  # ignore your own very recent messages
 DISCORD_CHAR_LIMIT = 2000  # Discord's maximum message length
+COOLDOWN_SECONDS = 30      # wait between /sumup runs, per user
+DAILY_LIMIT = 50           # successful summaries per user per day
+LIMIT_ZONE = ZoneInfo("America/Toronto")  # the daily limit resets at midnight here
+USAGE_KEEP_DAYS = 3        # how long old daily-usage rows are kept
 
 # Dropdown options for picking a mode: label shown to users, key used in code
 MODE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in MODES.items()]
@@ -58,13 +64,21 @@ class SumUp(discord.Client):
         # Connect to the database first, so commands can use it right away.
         await state.init(DATABASE_URL)
         print("Connected to the database")
-        # Syncing to one server makes command changes appear instantly.
-        self.tree.copy_global_to(guild=TEST_GUILD)
-        synced = await self.tree.sync(guild=TEST_GUILD)
-        print(f"Synced {len(synced)} command(s) to the test server")
+        prune_old_usage.start()
+
+        if TEST_GUILD:
+            # Development: sync to one server, which updates instantly
+            self.tree.copy_global_to(guild=TEST_GUILD)
+            synced = await self.tree.sync(guild=TEST_GUILD)
+            print(f"Synced {len(synced)} command(s) to the test server")
+        else:
+            # Production: sync everywhere (can take up to an hour to appear)
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} command(s) globally")
 
     async def close(self):
         # Runs on shutdown (like Ctrl + C): close database connections cleanly
+        prune_old_usage.cancel()
         await state.close()
         await super().close()
 
@@ -85,6 +99,103 @@ async def user_zone(user_id: int) -> Optional[ZoneInfo]:
     """The user's saved time zone, or None if they haven't set one."""
     zone = await state.get_timezone(user_id)
     return ZoneInfo(zone) if zone else None
+
+
+# --- Limits -------------------------------------------------------------------
+
+# user ID -> when their cooldown started (time.monotonic() seconds).
+# Kept in memory: a restart clearing a 30-second cooldown doesn't matter.
+_cooldowns: dict[int, float] = {}
+
+
+def limit_day(now: datetime):
+    """Which day a moment counts toward for the daily limit (the Toronto date)."""
+    return now.astimezone(LIMIT_ZONE).date()
+
+
+def next_reset(now: datetime) -> datetime:
+    """The next midnight in Toronto, when the daily limit resets.
+    Built from the date, so daylight saving changes are handled by zoneinfo."""
+    tomorrow = limit_day(now) + timedelta(days=1)
+    return datetime.combine(tomorrow, datetime.min.time(), tzinfo=LIMIT_ZONE)
+
+
+async def check_limits(user_id: int, now: datetime) -> Optional[str]:
+    """Return a message if the user has to wait, or None if they can go ahead."""
+    started = _cooldowns.get(user_id)
+    if started is not None:
+        remaining = COOLDOWN_SECONDS - (time.monotonic() - started)
+        if remaining > 0:
+            return f"Slow down a little! Try again in {int(remaining) + 1} seconds."
+
+    used = await state.get_usage(user_id, limit_day(now))
+    if used >= DAILY_LIMIT:
+        reset = discord_time(next_reset(now), "R")
+        return f"You've used all {DAILY_LIMIT} SumUps for today. Your limit resets {reset}."
+    return None
+
+
+@tasks.loop(hours=24)
+async def prune_old_usage():
+    """Once a day (and at startup), delete daily-usage rows older than a few days."""
+    today = limit_day(discord.utils.utcnow())
+    await state.prune_usage(today - timedelta(days=USAGE_KEEP_DAYS))
+
+
+# --- Finding what to summarize ------------------------------------------------
+
+@dataclass
+class Window:
+    """The messages a /sumup covers, and how that range was chosen."""
+    messages: list[discord.Message]  # newest first
+    start: Optional[datetime]        # known start point, if any
+    capped: bool                     # True if there were more than MESSAGE_CAP
+
+
+async def fetch_since(channel, start: datetime) -> Window:
+    """Messages after a time the user gave with `since`."""
+    messages = [
+        m async for m in channel.history(limit=MESSAGE_CAP + 1, after=start, oldest_first=False)
+    ]
+    return Window(messages[:MESSAGE_CAP], start, len(messages) > MESSAGE_CAP)
+
+
+async def fetch_missed(channel, user, now: datetime, last_sumup: Optional[datetime]) -> Window:
+    """Work backwards until we reach the user's last /sumup here or their
+    last message (ignoring their own messages from the last few minutes,
+    like "what did I miss?")."""
+    messages = []
+    start = None
+    async for m in channel.history(limit=MESSAGE_CAP + 1):
+        if last_sumup and m.created_at <= last_sumup:
+            start = last_sumup
+            break
+        if m.author.id == user.id and m.created_at <= now - OWN_MESSAGE_GRACE:
+            start = m.created_at
+            break
+        messages.append(m)
+    return Window(messages[:MESSAGE_CAP], start, len(messages) > MESSAGE_CAP)
+
+
+def range_note(window: Window, used_since: bool, last_sumup: Optional[datetime]) -> str:
+    """A short line under the header explaining the range, when it isn't obvious."""
+    first_time = not used_since and not last_sumup
+    if window.capped:
+        if first_time:
+            return (
+                f"\n-# This is your first SumUp here, so this covers the last {MESSAGE_CAP} "
+                f"messages. Next time it'll pick up where you left off."
+            )
+        return (
+            f"\n-# You missed more than {MESSAGE_CAP} messages, so this covers the most "
+            f"recent {MESSAGE_CAP}."
+        )
+    if window.start is None and first_time:
+        return (
+            "\n-# This is your first SumUp here, so this covers the whole channel. "
+            "Next time it'll pick up where you left off."
+        )
+    return ""
 
 
 def format_message(message: discord.Message, tz: Optional[ZoneInfo]) -> Optional[str]:
@@ -118,9 +229,10 @@ def split_message(text: str, limit: int = DISCORD_CHAR_LIMIT) -> list[str]:
     return chunks
 
 
-def discord_time(dt: datetime) -> str:
-    """Discord timestamp markup: each viewer sees it in their own local time."""
-    return f"<t:{int(dt.timestamp())}:f>"
+def discord_time(dt: datetime, style: str = "f") -> str:
+    """Discord timestamp markup: each viewer sees it in their own local time.
+    Style "f" shows a date and time; "R" shows relative time like "in 3 hours"."""
+    return f"<t:{int(dt.timestamp())}:{style}>"
 
 
 async def send_summary(
@@ -147,11 +259,31 @@ async def send_summary(
     return True
 
 
-# --- Events -------------------------------------------------------------------
+# --- Events and errors ----------------------------------------------------------
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
+
+
+@client.tree.error
+async def on_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Last line of defense: any error a command didn't handle itself
+    (like the database being unreachable) gets a friendly reply instead of silence."""
+    print(f"Error in /{interaction.command.name if interaction.command else '?'}: {error!r}")
+    if isinstance(error, app_commands.NoPrivateMessage):
+        text = "SumUp only works in servers, not in DMs."
+    else:
+        text = "Something went wrong on my end. Please try again in a moment."
+    if interaction.command and interaction.command.name == "sumup":
+        _cooldowns.pop(interaction.user.id, None)  # a failed run shouldn't cost a cooldown
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except discord.HTTPException:
+        pass  # the interaction expired; nothing more we can do
 
 
 # --- Commands -----------------------------------------------------------------
@@ -166,6 +298,7 @@ async def ping(interaction: discord.Interaction):
 
 
 @client.tree.command(name="sumup", description="Summarize what you missed in this channel")
+@app_commands.guild_only()
 @app_commands.describe(
     since="When you were last here, like 2h, 4:00 PM, or Sep 22 6:23 PM",
     mode="Summary style for this one summary (default: your /mode setting)",
@@ -181,77 +314,58 @@ async def sumup(
     now = discord.utils.utcnow()
     user = interaction.user
     channel = interaction.channel
+
+    wait_message = await check_limits(user.id, now)
+    if wait_message:
+        await interaction.followup.send(wait_message, ephemeral=True)
+        return
+    _cooldowns[user.id] = time.monotonic()  # start now, so double-clicks are blocked
+
     tz = await user_zone(user.id)
     last_sumup = await state.get_last_sumup(user.id, channel.id)
-    start = None
+
+    if since:
+        try:
+            start = parse_since(since, now, tz)
+        except SinceError as error:
+            _cooldowns.pop(user.id, None)  # a typo shouldn't cost a cooldown
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
 
     try:
         if since:
-            # The user told us when they were last here
-            try:
-                start = parse_since(since, now, tz)
-            except SinceError as error:
-                await interaction.followup.send(str(error), ephemeral=True)
-                return
-            # Newest first, stopping at the start time; one extra to detect the cap
-            messages = [
-                m async for m in channel.history(limit=MESSAGE_CAP + 1, after=start, oldest_first=False)
-            ]
+            window = await fetch_since(channel, start)
         else:
-            # Work backwards until we reach the user's last /sumup here
-            # or their last message (ignoring messages from the last few minutes,
-            # like "what did I miss?")
-            messages = []
-            async for m in channel.history(limit=MESSAGE_CAP + 1):
-                if last_sumup and m.created_at <= last_sumup:
-                    start = last_sumup
-                    break
-                if m.author.id == user.id and m.created_at <= now - OWN_MESSAGE_GRACE:
-                    start = m.created_at
-                    break
-                messages.append(m)
+            window = await fetch_missed(channel, user, now, last_sumup)
     except discord.Forbidden:
+        _cooldowns.pop(user.id, None)
         await interaction.followup.send(
             "I don't have permission to read this channel's history.", ephemeral=True
         )
         return
 
-    # Explain to the user what range this summary covers, when it isn't obvious
-    note = ""
-    capped = len(messages) > MESSAGE_CAP
-    if capped:
-        messages = messages[:MESSAGE_CAP]
-        if since or last_sumup:
-            note = (
-                f"\n-# You missed more than {MESSAGE_CAP} messages, so this covers the most "
-                f"recent {MESSAGE_CAP}."
-            )
-        else:
-            note = (
-                f"\n-# This is your first SumUp here, so this covers the last {MESSAGE_CAP} "
-                f"messages. Next time it'll pick up where you left off."
-            )
-    elif start is None and not last_sumup:
-        note = (
-            "\n-# This is your first SumUp here, so this covers the whole channel. "
-            "Next time it'll pick up where you left off."
-        )
-
-    lines = [line for m in reversed(messages) if (line := format_message(m, tz))]
+    lines = [line for m in reversed(window.messages) if (line := format_message(m, tz))]
     if not lines:
+        _cooldowns.pop(user.id, None)  # nothing was summarized, so no cooldown
         await state.set_last_sumup(user.id, channel.id, now)
         await interaction.followup.send("You're all caught up! No new messages.", ephemeral=True)
         return
 
     # Without a known start point, the summary starts at the oldest message read
-    shown_start = start if start and not capped else messages[-1].created_at
+    if window.start and not window.capped:
+        shown_start = window.start
+    else:
+        shown_start = window.messages[-1].created_at
     mode_key = await resolve_mode(user.id, mode)
     header = (
         f"**Σ SumUp ({MODES[mode_key]}): {len(lines)} messages since "
-        f"{discord_time(shown_start)}**{note}"
+        f"{discord_time(shown_start)}**{range_note(window, bool(since), last_sumup)}"
     )
     if await send_summary(interaction, header, lines, mode_key):
         await state.set_last_sumup(user.id, channel.id, now)
+        await state.add_usage(user.id, limit_day(now))
+    else:
+        _cooldowns.pop(user.id, None)  # the summarizer failed, so let them retry
 
 
 @sumup.autocomplete("since")
@@ -321,6 +435,55 @@ async def zone_autocomplete(interaction: discord.Interaction, current: str):
         )
         for zone in search_zones(current)
     ]
+
+
+@client.tree.command(name="forget", description="Delete everything SumUp has saved about you")
+async def forget(interaction: discord.Interaction):
+    view = ForgetConfirm(interaction.user.id)
+    await interaction.response.send_message(
+        "This deletes your time zone, default mode, and where each of your SumUps "
+        "left off in every channel. Your next SumUp will start fresh.\n"
+        "-# Your daily SumUp count isn't reset, so the daily limit stays fair.",
+        view=view,
+        ephemeral=True,
+    )
+    view.message_interaction = interaction
+
+
+class ForgetConfirm(discord.ui.View):
+    """Confirm / Cancel buttons for /forget."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)  # buttons stop working after 60 seconds
+        self.user_id = user_id
+        self.message_interaction: Optional[discord.Interaction] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Only the person who ran /forget can press the buttons
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Delete my data", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await state.forget_user(self.user_id)
+        self.stop()
+        await interaction.response.edit_message(
+            content="Done. Everything SumUp saved about you has been deleted.", view=None
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nothing was deleted.", view=None)
+
+    async def on_timeout(self):
+        if self.message_interaction:
+            try:
+                await self.message_interaction.edit_original_response(
+                    content="Timed out. Nothing was deleted. Run /forget again if you still want to.",
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
 
 
 client.run(TOKEN)

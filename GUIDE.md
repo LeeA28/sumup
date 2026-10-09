@@ -308,7 +308,9 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
   - **Client and daemon:** the `docker` command is a client that sends instructions to the daemon (the engine), which runs inside WSL2 on Windows.
 - **Port mapping `127.0.0.1:5432:5432`:** the container's Postgres port is reachable from this PC only, not from other devices on the network.
 - **The password `sumup_dev`** is local-only. Production uses Railway's generated credentials.
-- **Version:** `postgres:17`, to be matched to Railway's Postgres version in Step 8.
+- **Version:** `postgres:18`, matching Railway's database (originally 17; switched in Step 8).
+  - Postgres can't read data files from a different major version, so switching meant deleting the local volume (`docker compose down -v`) and starting fresh. Only local test data was lost.
+  - The Postgres 18 image stores data in a version-named folder under `/var/lib/postgresql`, so the volume mounts at `/var/lib/postgresql` instead of `/var/lib/postgresql/data`.
 - **Windows setup notes:** Docker Desktop needs WSL2 and the Virtual Machine Platform Windows feature (enabled from an administrator PowerShell, followed by a full restart).
 
 ### Configuration
@@ -401,7 +403,7 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 ### Railway
 
 - **Builder:** Railway's Railpack detects Python from `requirements.txt`, reads the Python version from `.python-version` (pinned to 3.13 to match development), and automatically runs `bot.py` (it checks for `main.py`, `app.py`, `start.py`, then `bot.py`).
-- **Database:** a Railway Postgres service. The bot's `DATABASE_URL` uses Railway's reference variable `${{Postgres.DATABASE_URL}}`, which points at the database over Railway's private network.
+- **Database:** a Railway Postgres service (Postgres 18; local development uses the same version). Public Access stays off, so the database is reachable only over Railway's private network. The bot's `DATABASE_URL` uses Railway's reference variable `${{Postgres.DATABASE_URL}}`, which points at the database over Railway's private network.
 - **Separate secrets:** a production OpenAI key separate from the 30-day dev key, so either can be revoked without affecting the other.
 - **Plan:** started on the Trial (a one-time $5 credit), with the Hobby plan ($5/month including $5 of usage) as the next step.
 
@@ -414,3 +416,10 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 ### README
 
 - `README.md` explains what SumUp does, the commands, how it works, the design decisions, the tech stack, and how to run it locally. It's the page linked from the resume.
+
+### Deployed
+
+- Railway build used `python@3.13.16` (from `.python-version`), and the service is "unexposed": a Discord bot only makes outgoing connections, so it needs no public address.
+- Startup logs showed `Connected to the database`, `Synced 5 command(s) globally`, and `Logged in as SumUp`.
+- Lines marked red in Railway's logs were discord.py `[INFO]` messages: Python's logging writes to stderr by default, and Railway colors stderr red.
+- Invite link permissions value `84992` = View Channels (1024) + Send Messages (2048) + Embed Links (16384) + Read Message History (65536). Discord encodes permissions as bit flags, each a power of 2, added together.

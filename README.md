@@ -4,6 +4,8 @@ A Discord bot that tells you what you missed. Run `/sumup` in any channel and ge
 
 Built with Python, discord.py, the OpenAI API (GPT-6 Luna), and PostgreSQL. Deployed on Railway.
 
+**[Add SumUp to your server](https://discord.com/oauth2/authorize?client_id=1411077447750782986&permissions=84992&integration_type=0&scope=applications.commands+bot)**
+
 ## Commands
 
 | Command | What it does |

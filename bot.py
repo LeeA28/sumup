@@ -12,7 +12,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import state
-from summarizer import DEFAULT_MODE, MODES, summarize_transcript
+from summarizer import DEFAULT_MODE, MODES, summarize
 from timeutils import (
     ALL_ZONES,
     SinceError,
@@ -38,8 +38,10 @@ if not ALL_ZONES:
 # The test server, if one is set
 TEST_GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
-MESSAGE_CAP = 500          # most messages /sumup will read at once
+MESSAGE_CAP = 1000         # most messages /sumup will read at once
+FIRST_TIME_CAP = 200       # messages covered on someone's first /sumup in a channel
 BIG_SUMMARY = 200          # above this many messages, allow more bullets
+BUTTON_MINUTES = 14        # buttons stop working just before Discord's 15-minute limit
 OWN_MESSAGE_GRACE = timedelta(minutes=10)  # ignore your own very recent messages
 DISCORD_CHAR_LIMIT = 2000  # Discord's maximum message length
 COOLDOWN_SECONDS = 30      # wait between /sumup runs, per user
@@ -92,7 +94,14 @@ async def resolve_mode(user_id: int, choice: Optional[app_commands.Choice[str]])
     """The mode picked for this command, else the user's default, else bullets."""
     if choice:
         return choice.value
-    return await state.get_mode(user_id) or DEFAULT_MODE
+    return await saved_mode(user_id)
+
+
+async def saved_mode(user_id: int) -> str:
+    """The user's saved default mode. A mode that no longer exists
+    (Brief and Action items were removed) falls back to the default."""
+    mode = await state.get_mode(user_id)
+    return mode if mode in MODES else DEFAULT_MODE
 
 
 async def user_zone(user_id: int) -> Optional[ZoneInfo]:
@@ -177,23 +186,18 @@ async def fetch_missed(channel, user, now: datetime, last_sumup: Optional[dateti
     return Window(messages[:MESSAGE_CAP], start, len(messages) > MESSAGE_CAP)
 
 
-def range_note(window: Window, used_since: bool, last_sumup: Optional[datetime]) -> str:
+def range_note(window: Window, first_time: bool) -> str:
     """A short line under the header explaining the range, when it isn't obvious."""
-    first_time = not used_since and not last_sumup
-    if window.capped:
-        if first_time:
-            return (
-                f"\n-# This is your first SumUp here, so this covers the last {MESSAGE_CAP} "
-                f"messages. Next time it'll pick up where you left off."
-            )
+    if first_time:
+        covered = f"the last {FIRST_TIME_CAP} messages" if window.capped else "the whole channel"
         return (
-            f"\n-# You missed more than {MESSAGE_CAP} messages, so this covers the most "
-            f"recent {MESSAGE_CAP}."
+            f"\n-# This is your first SumUp here, so this covers {covered}. "
+            f"Next time it'll pick up where you left off. New to SumUp? Try `/help`."
         )
-    if window.start is None and first_time:
+    if window.capped:
         return (
-            "\n-# This is your first SumUp here, so this covers the whole channel. "
-            "Next time it'll pick up where you left off."
+            f"\n-# You missed more than {MESSAGE_CAP:,} messages, so this covers the most "
+            f"recent {MESSAGE_CAP:,}."
         )
     return ""
 
@@ -235,28 +239,132 @@ def discord_time(dt: datetime, style: str = "f") -> str:
     return f"<t:{int(dt.timestamp())}:{style}>"
 
 
-async def send_summary(
-    interaction: discord.Interaction, header: str, lines: list[str], mode: str
-) -> bool:
-    """Summarize transcript lines and send the result. Returns True on success."""
-    max_bullets = 8 if len(lines) > BIG_SUMMARY else 6
-    try:
-        summary = await summarize_transcript("\n".join(lines), mode=mode, max_bullets=max_bullets)
-    except openai.APIError as error:
-        print(f"OpenAI error: {error!r}")  # full details for you, in the terminal
-        await interaction.followup.send(
-            "Sorry, I couldn't reach the summarizer right now. Try again in a moment.",
-            ephemeral=True,
+# --- Summaries and their buttons ---------------------------------------------
+
+@dataclass
+class SummaryRun:
+    """One /sumup: the messages it covers, and every style written for it so far."""
+    user_id: int
+    channel: discord.abc.Messageable
+    lines: list[str]               # transcript lines, oldest first
+    shown_start: datetime          # the "since" time in the header
+    note: str                      # the grey note under the header (private replies only)
+    results: dict[str, str]        # mode -> summary text, so each style is written once
+    shared: bool = False           # each summary can be shared publicly once
+
+    def header(self, mode: str) -> str:
+        return (
+            f"**Σ SumUp ({MODES[mode]}): {len(self.lines)} messages since "
+            f"{discord_time(self.shown_start)}**{self.note}"
         )
-        return False
 
-    if not summary:
-        await interaction.followup.send("The summarizer returned nothing. Try again.", ephemeral=True)
-        return False
+    async def write(self, mode: str) -> str:
+        """Return this run's summary in `mode`, calling the model only the first time."""
+        if mode not in self.results:
+            max_bullets = 8 if len(self.lines) > BIG_SUMMARY else 6
+            summary = await summarize(self.lines, mode=mode, max_bullets=max_bullets)
+            if not summary:
+                raise EmptySummary()
+            self.results[mode] = summary
+        return self.results[mode]
 
-    for chunk in split_message(f"{header}\n{summary}"):
+
+class EmptySummary(Exception):
+    """The model returned no text."""
+
+
+SUMMARIZER_DOWN = "Sorry, I couldn't reach the summarizer right now. Try again in a moment."
+SUMMARIZER_EMPTY = "The summarizer returned nothing. Try again."
+
+
+async def send_private(interaction: discord.Interaction, run: SummaryRun, mode: str) -> None:
+    """Send the run's summary privately, with the buttons on the last message."""
+    chunks = split_message(f"{run.header(mode)}\n{run.results[mode]}")
+    for chunk in chunks[:-1]:
         await interaction.followup.send(chunk, ephemeral=True)
-    return True
+    view = SummaryView(run, mode)
+    view.message = await interaction.followup.send(chunks[-1], ephemeral=True, view=view, wait=True)
+
+
+class SummaryView(discord.ui.View):
+    """Share to channel and Switch style buttons under a private summary."""
+
+    def __init__(self, run: SummaryRun, mode: str):
+        super().__init__(timeout=BUTTON_MINUTES * 60)
+        self.run = run
+        self.mode = mode
+        self.message: Optional[discord.WebhookMessage] = None
+        self.other = next(m for m in MODES if m != mode)
+
+        self.share_button.disabled = run.shared
+        if run.shared:
+            self.share_button.label = "Shared"
+        self.switch_button.label = f"Switch to {MODES[self.other]}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.run.user_id
+
+    @discord.ui.button(label="Share to channel", emoji="📢", style=discord.ButtonStyle.primary)
+    async def share_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        name = discord.utils.escape_markdown(interaction.user.display_name)
+        public = (
+            f"**Σ SumUp ({MODES[self.mode]}), shared by {name}: {len(self.run.lines)} messages "
+            f"since {discord_time(self.run.shown_start)}**\n{self.run.results[self.mode]}"
+        )
+        try:
+            for chunk in split_message(public):
+                # AllowedMentions.none(): nothing in a shared summary can ping anyone
+                await self.run.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to post in this channel.", ephemeral=True
+            )
+            return
+        self.run.shared = True
+        button.disabled = True
+        button.label = "Shared"
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Switch", style=discord.ButtonStyle.secondary)
+    async def switch_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        target = self.other
+        is_new = target not in self.run.results
+        now = discord.utils.utcnow()
+
+        if is_new and await state.get_usage(self.run.user_id, limit_day(now)) >= DAILY_LIMIT:
+            reset = discord_time(next_reset(now), "R")
+            await interaction.response.send_message(
+                f"You've used all {DAILY_LIMIT} SumUps for today. Your limit resets {reset}.",
+                ephemeral=True,
+            )
+            return
+
+        # Remove these buttons while the other style is written, and say what's happening
+        original = interaction.message.content if interaction.message else ""
+        await interaction.response.edit_message(
+            content=f"{original}\n-# Writing the {MODES[target]} version…", view=None
+        )
+        try:
+            await self.run.write(target)
+        except (openai.APIError, EmptySummary) as error:
+            print(f"Switch failed: {error!r}")
+            await interaction.edit_original_response(content=original, view=self)
+            text = SUMMARIZER_EMPTY if isinstance(error, EmptySummary) else SUMMARIZER_DOWN
+            await interaction.followup.send(text, ephemeral=True)
+            return
+
+        if is_new:
+            await state.add_usage(self.run.user_id, limit_day(now))
+        await interaction.edit_original_response(content=original)
+        self.stop()
+        await send_private(interaction, self.run, target)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass  # too late to edit; Discord shows the buttons as expired
 
 
 # --- Events and errors ----------------------------------------------------------
@@ -287,15 +395,6 @@ async def on_command_error(interaction: discord.Interaction, error: app_commands
 
 
 # --- Commands -----------------------------------------------------------------
-
-@client.tree.command(name="ping", description="Check that SumUp is online")
-async def ping(interaction: discord.Interaction):
-    latency_ms = round(client.latency * 1000)
-    await interaction.response.send_message(
-        f"Σ Pong! Latency: {latency_ms} ms",
-        ephemeral=True,  # "Only you can see this"
-    )
-
 
 @client.tree.command(name="sumup", description="Summarize what you missed in this channel")
 @app_commands.guild_only()
@@ -344,6 +443,12 @@ async def sumup(
         )
         return
 
+    # First /sumup in this channel with no earlier message of yours found:
+    # cover just the most recent messages, as background
+    first_time = not since and not last_sumup and window.start is None
+    if first_time and len(window.messages) > FIRST_TIME_CAP:
+        window = Window(window.messages[:FIRST_TIME_CAP], None, True)
+
     lines = [line for m in reversed(window.messages) if (line := format_message(m, tz))]
     if not lines:
         _cooldowns.pop(user.id, None)  # nothing was summarized, so no cooldown
@@ -356,16 +461,28 @@ async def sumup(
         shown_start = window.start
     else:
         shown_start = window.messages[-1].created_at
+
     mode_key = await resolve_mode(user.id, mode)
-    header = (
-        f"**Σ SumUp ({MODES[mode_key]}): {len(lines)} messages since "
-        f"{discord_time(shown_start)}**{range_note(window, bool(since), last_sumup)}"
+    run = SummaryRun(
+        user_id=user.id,
+        channel=channel,
+        lines=lines,
+        shown_start=shown_start,
+        note=range_note(window, first_time),
+        results={},
     )
-    if await send_summary(interaction, header, lines, mode_key):
-        await state.set_last_sumup(user.id, channel.id, now)
-        await state.add_usage(user.id, limit_day(now))
-    else:
+    try:
+        await run.write(mode_key)
+    except (openai.APIError, EmptySummary) as error:
+        print(f"Summary failed: {error!r}")
         _cooldowns.pop(user.id, None)  # the summarizer failed, so let them retry
+        text = SUMMARIZER_EMPTY if isinstance(error, EmptySummary) else SUMMARIZER_DOWN
+        await interaction.followup.send(text, ephemeral=True)
+        return
+
+    await state.set_last_sumup(user.id, channel.id, now)
+    await state.add_usage(user.id, limit_day(now))
+    await send_private(interaction, run, mode_key)
 
 
 @sumup.autocomplete("since")
@@ -386,6 +503,35 @@ async def since_autocomplete(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=label[:100], value=current[:100])]
 
 
+HELP_TEXT = f"""**Σ SumUp** catches you up on conversations you missed. Every reply is private unless you share it.
+
+**Commands**
+`/sumup`: summarize what you missed in this channel
+- Starts from your last `/sumup` here or your last message, whichever is more recent
+- First time in a channel: covers the last {FIRST_TIME_CAP} messages
+- `since`: start from a time instead, like `2h`, `30m`, `4pm`, `yesterday 9pm`, or `Sep 22 6:23 PM`
+- `mode`: **Bullets** (quick points) or **Detailed** (by topic, with to-dos and open questions)
+`/mode`: set your default style
+`/timezone`: set your time zone so times like `4pm` mean your 4 PM
+`/forget`: delete everything SumUp has saved about you
+`/help`: show this message
+
+**Under each summary**
+- **Share to channel** posts it publicly so everyone can see it
+- **Switch to Detailed / Bullets** rewrites the same messages in the other style
+- Buttons work for about {BUTTON_MINUTES} minutes
+
+**Limits**
+- One `/sumup` every {COOLDOWN_SECONDS} seconds, {DAILY_LIMIT} a day (resets at midnight Eastern)
+- Up to {MESSAGE_CAP:,} messages per summary
+-# SumUp never stores message text. Summaries are written by OpenAI."""
+
+
+@client.tree.command(name="help", description="What SumUp does and how to use it")
+async def help_command(interaction: discord.Interaction):
+    await interaction.response.send_message(HELP_TEXT, ephemeral=True)
+
+
 @client.tree.command(name="mode", description="Set your default summary style")
 @app_commands.describe(mode="Your default style (leave empty to see your current one)")
 @app_commands.choices(mode=MODE_CHOICES)
@@ -394,7 +540,7 @@ async def set_mode(
     mode: Optional[app_commands.Choice[str]] = None,
 ):
     if mode is None:
-        current = MODES[await state.get_mode(interaction.user.id) or DEFAULT_MODE]
+        current = MODES[await saved_mode(interaction.user.id)]
         await interaction.response.send_message(
             f"Your default mode is **{current}**. Pick a mode in this command to change it.",
             ephemeral=True,

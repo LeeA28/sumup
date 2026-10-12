@@ -8,7 +8,7 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 - **Discord library:** discord.py
 - **LLM:** OpenAI API, model GPT-6 Luna, reasoning effort low
 - **Secrets:** python-dotenv with a gitignored `.env` file
-- **Hosting (planned):** Railway
+- **Hosting:** Railway
 
 ## Key decisions
 
@@ -423,3 +423,49 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 - Startup logs showed `Connected to the database`, `Synced 5 command(s) globally`, and `Logged in as SumUp`.
 - Lines marked red in Railway's logs were discord.py `[INFO]` messages: Python's logging writes to stderr by default, and Railway colors stderr red.
 - Invite link permissions value `84992` = View Channels (1024) + Send Messages (2048) + Embed Links (16384) + Read Message History (65536). Discord encodes permissions as bit flags, each a power of 2, added together.
+
+## Step 9: Feedback round (simpler styles, buttons, /help, long chats)
+
+### What changed and why
+
+- **Two styles instead of four.** Brief, Bullets, Detailed, and Action items overlapped: Bullets is already short, and action items fit inside Detailed. Now:
+  - **Bullets** (default): unchanged.
+  - **Detailed:** by topic, then a "To-dos" section (`name: task`) and a "Still open" section.
+  - **Fallback:** a saved default that no longer exists (`brief` or `action` in the database) is treated as Bullets (`saved_mode` in `bot.py`), so old rows can't crash anything and no database migration was needed.
+- **`/ping` removed.** Railway's logs show whether the bot is online, so users didn't need it.
+- **`/help` added.** A private overview of commands, `since` formats, styles, buttons, and limits. The first-time note now ends with "New to SumUp? Try `/help`."
+- **Discovery:** the bot profile description (Developer Portal → General Information → Description) explains SumUp to anyone who clicks the bot. A welcome message on joining a server was considered and skipped to keep SumUp from ever posting unprompted.
+
+### Buttons under each summary (`SummaryView`)
+
+- **Buttons are a `discord.ui.View`** attached to the last private message of a summary.
+- **Share to channel:**
+  - Posts the summary publicly with `channel.send`, labeled "shared by" the user's display name.
+  - `AllowedMentions.none()` means nothing in a shared summary can ping anyone, even if the summary text contains `@names`.
+  - The private range note (like "This is your first SumUp here") is left out of the public version, since it's about the person who ran the command.
+  - Each summary can be shared once; the button greys out and reads "Shared". No SumUp is used, since there's no OpenAI call.
+- **Switch to Detailed / Bullets:**
+  - Re-summarizes the same transcript in the other style and sends it as a new private message.
+  - `SummaryRun.results` caches each style, so each is written at most once per summary; switching back is instant and free.
+  - The first switch counts toward the daily limit but skips the 30-second cooldown (it's a click on an existing summary, not a new `/sumup`).
+  - While it works, the old buttons disappear and a grey line says "Writing the Detailed version…". On failure the buttons come back and the user gets the usual error message.
+- **Timeout:** Discord only lets a bot edit a private reply for 15 minutes, so buttons are removed after 14 (`BUTTON_MINUTES`). A bot restart also ends them; clicking an old one shows Discord's "This interaction failed".
+- **`interaction_check`** limits the buttons to the person who ran `/sumup`.
+
+### Message limits
+
+- **First SumUp in a channel:** if none of the user's messages turn up, only the last 200 (`FIRST_TIME_CAP`) are covered, since newcomers want recent context, not the channel's whole history. If an older message of theirs is found, it catches up from there.
+- **Everyone else and `since`:** up to 1,000 messages (`MESSAGE_CAP`, raised from 500).
+
+### Long conversations: map-reduce summarization (`summarizer.py`)
+
+- **The problem:** a model can only summarize what it's given, and very long inputs make it skim details in the middle.
+- **Up to 250 messages (`CHUNK_SIZE`):** one call, as before.
+- **More than 250:**
+  - **Map:** split into the fewest chunks of at most 250, kept roughly equal (260 messages become 2 × 130, not 250 + 10). The model takes detailed notes on each chunk: topics and who said what, decisions, tasks, open questions, and plans that changed.
+  - The chunk calls run at the same time with `asyncio.gather`, so 4 chunks take about as long as 1.
+  - **Reduce:** one final call combines the notes, in order, into Bullets or Detailed. It's told later parts are more recent, so a changed plan is reported in its final form.
+  - 1,000 messages = 4 chunk calls + 1 combine = 5 calls, about $0.003, and still one SumUp.
+- **Why 250:** about 6,000 tokens per chunk, small enough for close reading. Smaller chunks (10 or 100) split conversations into meaningless fragments, swamp the combine step with many notes, cost more in per-call overhead, and risk OpenAI's per-minute limits. 500 would be faster for 251–500 messages but reads less closely. It's one constant, to tune after testing with a long chat.
+- **Mid-conversation rule (every prompt):** the transcript may start partway through a conversation; if messages refer to something not shown, say earlier context is missing instead of guessing.
+- The OpenAI client timeout went from 30 to 60 seconds, since a combine call can follow the chunk calls.

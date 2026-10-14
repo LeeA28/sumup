@@ -10,7 +10,7 @@ Built with Python, discord.py, the OpenAI API (GPT-6 Luna), and PostgreSQL. Depl
 
 | Command | What it does |
 |---|---|
-| `/sumup` | Summarizes what you missed in this channel. Picks up from your last `/sumup` or your last message, whichever is more recent. New here? You get the last 200 messages. |
+| `/sumup` | Summarizes what you missed in this channel. Just type `/sumup` and press Enter; both options are optional. Picks up from your last `/sumup` or your last message, whichever is more recent. New here? You get the last 200 messages. |
 | `/sumup since:2h` | Summarizes from a time you choose: `2h`, `30m`, `4:00 PM`, `yesterday 9pm`, or `Sep 22 6:23 PM` (the format of Discord's "new messages since" banner). A live preview shows how SumUp reads your input as you type. |
 | `/sumup mode:` | One-time summary style: **Bullets** (quick points) or **Detailed** (grouped by topic, with to-dos and open questions). |
 | `/mode` | Sets your default summary style. |

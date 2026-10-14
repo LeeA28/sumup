@@ -514,11 +514,14 @@ async def on_command_error(interaction: discord.Interaction, error: app_commands
 
 # --- Commands -----------------------------------------------------------------
 
-@client.tree.command(name="sumup", description="Summarize what you missed in this channel")
+@client.tree.command(
+    name="sumup",
+    description="Catch up on what you missed here. Just press Enter; the options below are optional.",
+)
 @app_commands.guild_only()
 @app_commands.describe(
-    since="When you were last here, like 2h, 4:00 PM, or Sep 22 6:23 PM",
-    mode="Summary style for this one summary (default: your /mode setting)",
+    since="Optional: start from a time instead, like 2h, 4pm, or Sep 22 6:23 PM",
+    mode="Optional: Bullets or Detailed for this summary (default: your /mode setting)",
 )
 @app_commands.choices(mode=MODE_CHOICES)
 async def sumup(
@@ -637,6 +640,7 @@ HELP_TEXT = f"""**Σ SumUp** catches you up on conversations you missed. Every r
 
 **Commands**
 `/sumup`: summarize what you missed in this channel
+- You don't need to fill in any options; just type `/sumup` and press Enter
 - Starts from your last `/sumup` here or your last message, whichever is more recent
 - First time in a channel: covers the last {FIRST_TIME_CAP} messages
 - `since`: start from a time instead, like `2h`, `30m`, `4pm`, `yesterday 9pm`, or `Sep 22 6:23 PM`

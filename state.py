@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS last_sumups (
     PRIMARY KEY (user_id, channel_id)   -- one time per user per channel
 );
 
+-- Added later: where each user's last summary started, for "Summarize again".
+-- ADD COLUMN IF NOT EXISTS upgrades tables created before this column existed.
+ALTER TABLE last_sumups ADD COLUMN IF NOT EXISTS last_start_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS daily_usage (
     user_id  BIGINT NOT NULL,
     day      DATE NOT NULL,        -- Toronto date the usage counts toward
@@ -89,13 +93,28 @@ async def get_last_sumup(user_id: int, channel_id: int) -> Optional[datetime]:
     )
 
 
-async def set_last_sumup(user_id: int, channel_id: int, when: datetime) -> None:
+async def get_last_range(user_id: int, channel_id: int) -> Optional[tuple[datetime, datetime]]:
+    """(first message covered, when the summary ran) for the user's last summary
+    in this channel, or None if there isn't one with a known start."""
+    row = await _pool.fetchrow(
+        "SELECT last_start_at, last_sumup_at FROM last_sumups WHERE user_id = $1 AND channel_id = $2",
+        user_id, channel_id,
+    )
+    if row is None or row["last_start_at"] is None:
+        return None
+    return row["last_start_at"], row["last_sumup_at"]
+
+
+async def set_last_sumup(user_id: int, channel_id: int, when: datetime, start: datetime) -> None:
+    """Save when the user's latest summary here ran, and the first message it covered."""
     await _pool.execute(
         """
-        INSERT INTO last_sumups (user_id, channel_id, last_sumup_at) VALUES ($1, $2, $3)
-        ON CONFLICT (user_id, channel_id) DO UPDATE SET last_sumup_at = EXCLUDED.last_sumup_at
+        INSERT INTO last_sumups (user_id, channel_id, last_sumup_at, last_start_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id, channel_id) DO UPDATE
+        SET last_sumup_at = EXCLUDED.last_sumup_at, last_start_at = EXCLUDED.last_start_at
         """,
-        user_id, channel_id, when,
+        user_id, channel_id, when, start,
     )
 
 

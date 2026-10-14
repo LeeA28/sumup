@@ -52,7 +52,7 @@ flowchart TD
     H2 -- No --> I
     H3 --> I
     G --> I{"Any new messages<br/>from people?"}
-    I -- No --> I1["You're all caught up!<br/>No new messages."]
+    I -- No --> I1["You're all caught up!<br/>with a Summarize again button"]
     I -- Yes --> J["Build transcript<br/>[4:05 PM] maya: ...<br/>skip bots, keep attachments"]
     J --> K["Pick style: the mode option,<br/>else your /mode default,<br/>else Bullets"]
     K --> L0{"More than 250<br/>messages?"}
@@ -80,6 +80,10 @@ Step by step, with what's happening behind the scenes:
 9. **The buttons** (they work for about 14 minutes, until just before Discord stops letting the bot edit private replies):
    - **Share to channel** posts the summary publicly as "Σ SumUp (Bullets), shared by Andy". Mentions are turned off, so nobody gets pinged. Each summary can be shared once, and sharing doesn't use a SumUp.
    - **Switch to Detailed / Switch to Bullets** rewrites the same messages in the other style as a new private message. Each style is written at most once per summary, so switching back is instant and free. The first switch uses one SumUp but skips the 30-second cooldown.
+
+10. **Summarize again.** Private replies vanish if you dismiss them or reload Discord. If you run `/sumup` with nothing new, the "all caught up" reply has a **Summarize again** button that brings back your last summary for that channel:
+    - **Within an hour:** SumUp shows the exact same summary from a short-term copy kept in memory. Instant and free.
+    - **After an hour, or after the bot restarts:** it re-reads the same messages (it saved where your last summary started) and writes a fresh one, which uses one SumUp.
 
 If a run ends without a summary (a bad `since`, nothing new, a permission problem, or an OpenAI error), it doesn't use up your cooldown or count toward the daily limit.
 
@@ -132,10 +136,10 @@ Earlier versions also had Brief and Action items. They were folded into these tw
 | Table | Contents | Kept |
 |---|---|---|
 | `user_settings` | Discord user ID, time zone, default mode | Until `/forget` |
-| `last_sumups` | User ID, channel ID, when you last ran `/sumup` there | Until `/forget` |
+| `last_sumups` | User ID, channel ID, when you last ran `/sumup` there, and where that summary started | Until `/forget` |
 | `daily_usage` | User ID, date, number of summaries | 3 days |
 
-Message text and summaries are never stored. Each summary does send that conversation's transcript to OpenAI so the model can write it.
+Message text and summaries are never saved to the database. Your most recent summary in each channel is kept **in the bot's memory for up to an hour** so Summarize again can show it instantly; it's gone sooner if the bot restarts, and `/forget` clears it. Each summary does send that conversation's transcript to OpenAI so the model can write it.
 
 ### Errors you might see
 
@@ -157,7 +161,8 @@ Message text and summaries are never stored. Each summary does send that convers
 - **Map-reduce for long conversations.** Catch-ups over 250 messages are split into chunks summarized in parallel, then combined. Each chunk stays small enough for the model to read closely, and running them at the same time keeps it about as fast as two calls. The chunk size is one setting (`CHUNK_SIZE`) so it can be tuned after testing.
 - **Fewer, clearer styles.** Four modes became two after noticing they overlapped: Bullets and Detailed form a simple short/long choice, and Detailed absorbed action items as a To-dos section.
 - **Cost controls.** A 30-second per-user cooldown and 50 summaries per user per day (resetting at midnight Toronto time). Only successful summaries count, and switching styles reuses a style that was already written. At the 1,000-message maximum, a summary costs about $0.003.
-- **Privacy.** SumUp stores only Discord IDs, settings, and timestamps; never message content. `/forget` deletes a user's data.
+- **A short-term cache instead of saved summaries.** Re-reading a dismissed summary uses an in-memory cache with a one-hour expiry rather than the database, because summaries contain conversation content. A cache hit is free and shows the identical summary; a miss falls back to rewriting it from the saved range. The limit: the cache lives in one bot process, so running several copies of SumUp would need a shared cache such as Redis.
+- **Privacy.** The database holds only Discord IDs, settings, and timestamps, never message content. `/forget` deletes a user's data, including anything in the cache.
 
 ## Tech stack
 

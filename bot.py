@@ -42,6 +42,7 @@ MESSAGE_CAP = 1000         # most messages /sumup will read at once
 FIRST_TIME_CAP = 200       # messages covered on someone's first /sumup in a channel
 BIG_SUMMARY = 200          # above this many messages, allow more bullets
 BUTTON_MINUTES = 14        # buttons stop working just before Discord's 15-minute limit
+CACHE_MINUTES = 60         # how long a summary is kept in memory for "Summarize again"
 OWN_MESSAGE_GRACE = timedelta(minutes=10)  # ignore your own very recent messages
 DISCORD_CHAR_LIMIT = 2000  # Discord's maximum message length
 COOLDOWN_SECONDS = 30      # wait between /sumup runs, per user
@@ -251,6 +252,7 @@ class SummaryRun:
     note: str                      # the grey note under the header (private replies only)
     results: dict[str, str]        # mode -> summary text, so each style is written once
     shared: bool = False           # each summary can be shared publicly once
+    last_mode: str = DEFAULT_MODE  # the style shown most recently
 
     def header(self, mode: str) -> str:
         return (
@@ -279,6 +281,7 @@ SUMMARIZER_EMPTY = "The summarizer returned nothing. Try again."
 
 async def send_private(interaction: discord.Interaction, run: SummaryRun, mode: str) -> None:
     """Send the run's summary privately, with the buttons on the last message."""
+    run.last_mode = mode
     chunks = split_message(f"{run.header(mode)}\n{run.results[mode]}")
     for chunk in chunks[:-1]:
         await interaction.followup.send(chunk, ephemeral=True)
@@ -367,6 +370,121 @@ class SummaryView(discord.ui.View):
                 pass  # too late to edit; Discord shows the buttons as expired
 
 
+# --- Short-term memory of recent summaries -------------------------------------
+
+# (user ID, channel ID) -> (expiry as time.monotonic() seconds, the summary run).
+# Memory only, never the database: it holds conversation content, so it expires
+# after CACHE_MINUTES, disappears on restart, and /forget clears it.
+_recent: dict[tuple[int, int], tuple[float, SummaryRun]] = {}
+
+
+def remember(run: SummaryRun, channel_id: int) -> None:
+    now = time.monotonic()
+    for key in [k for k, (expires, _) in _recent.items() if expires <= now]:
+        del _recent[key]  # drop anything expired while we're here
+    _recent[(run.user_id, channel_id)] = (now + CACHE_MINUTES * 60, run)
+
+
+def recall(user_id: int, channel_id: int) -> Optional[SummaryRun]:
+    entry = _recent.get((user_id, channel_id))
+    if entry is None or entry[0] <= time.monotonic():
+        _recent.pop((user_id, channel_id), None)
+        return None
+    return entry[1]
+
+
+def forget_recent(user_id: int) -> None:
+    for key in [k for k in _recent if k[0] == user_id]:
+        del _recent[key]
+
+
+REPEAT_NOTE = "\n-# A repeat of your last SumUp here."
+
+
+class AgainView(discord.ui.View):
+    """The "Summarize again" button on an "all caught up" reply."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=BUTTON_MINUTES * 60)
+        self.user_id = user_id
+        self.message: Optional[discord.WebhookMessage] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Summarize again", emoji="🔁", style=discord.ButtonStyle.primary)
+    async def again_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+        channel = interaction.channel
+
+        # Fast path: the last summary is still in memory, so show it again for free
+        run = recall(user.id, channel.id)
+        if run is not None:
+            run.note = REPEAT_NOTE
+            await interaction.response.edit_message(view=None)
+            self.stop()
+            await send_private(interaction, run, run.last_mode)
+            return
+
+        # Otherwise write it again from the same messages, which counts as a SumUp
+        now = discord.utils.utcnow()
+        wait_message = await check_limits(user.id, now)
+        if wait_message:
+            await interaction.response.send_message(wait_message, ephemeral=True)
+            return
+        last_range = await state.get_last_range(user.id, channel.id)
+        if last_range is None:
+            await interaction.response.send_message(
+                "I don't have a previous SumUp to repeat here. Try `/sumup since: 1h`.", ephemeral=True
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=f"{interaction.message.content}\n-# Summarizing again…", view=None
+        )
+        self.stop()
+        _cooldowns[user.id] = time.monotonic()
+
+        start, end = last_range
+        tz = await user_zone(user.id)
+        # 1 ms earlier so the first message of the original summary is included
+        messages = [
+            m async for m in channel.history(
+                limit=MESSAGE_CAP, after=start - timedelta(milliseconds=1), before=end, oldest_first=True
+            )
+        ]
+        lines = [line for m in messages if (line := format_message(m, tz))]
+        if not lines:
+            _cooldowns.pop(user.id, None)
+            await interaction.followup.send("Those messages aren't available anymore.", ephemeral=True)
+            return
+
+        run = SummaryRun(
+            user_id=user.id, channel=channel, lines=lines, shown_start=start,
+            note=REPEAT_NOTE, results={},
+        )
+        mode = await saved_mode(user.id)
+        try:
+            await run.write(mode)
+        except (openai.APIError, EmptySummary) as error:
+            print(f"Repeat failed: {error!r}")
+            _cooldowns.pop(user.id, None)
+            text = SUMMARIZER_EMPTY if isinstance(error, EmptySummary) else SUMMARIZER_DOWN
+            await interaction.followup.send(text, ephemeral=True)
+            return
+
+        await state.add_usage(user.id, limit_day(now))
+        remember(run, channel.id)
+        await send_private(interaction, run, mode)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
 # --- Events and errors ----------------------------------------------------------
 
 @client.event
@@ -452,8 +570,18 @@ async def sumup(
     lines = [line for m in reversed(window.messages) if (line := format_message(m, tz))]
     if not lines:
         _cooldowns.pop(user.id, None)  # nothing was summarized, so no cooldown
-        await state.set_last_sumup(user.id, channel.id, now)
-        await interaction.followup.send("You're all caught up! No new messages.", ephemeral=True)
+        has_previous = (
+            not since
+            and (recall(user.id, channel.id) or await state.get_last_range(user.id, channel.id))
+        )
+        if has_previous:
+            view = AgainView(user.id)
+            view.message = await interaction.followup.send(
+                "You're all caught up! No new messages since your last SumUp.",
+                ephemeral=True, view=view, wait=True,
+            )
+        else:
+            await interaction.followup.send("You're all caught up! No new messages.", ephemeral=True)
         return
 
     # Without a known start point, the summary starts at the oldest message read
@@ -480,8 +608,10 @@ async def sumup(
         await interaction.followup.send(text, ephemeral=True)
         return
 
-    await state.set_last_sumup(user.id, channel.id, now)
+    first_covered = window.messages[-1].created_at  # oldest message this summary read
+    await state.set_last_sumup(user.id, channel.id, now, first_covered)
     await state.add_usage(user.id, limit_day(now))
+    remember(run, channel.id)
     await send_private(interaction, run, mode_key)
 
 
@@ -520,6 +650,7 @@ HELP_TEXT = f"""**Σ SumUp** catches you up on conversations you missed. Every r
 - **Share to channel** posts it publicly so everyone can see it
 - **Switch to Detailed / Bullets** rewrites the same messages in the other style
 - Buttons work for about {BUTTON_MINUTES} minutes
+- Dismissed a summary? Run `/sumup` again and press **Summarize again** to get it back
 
 **Limits**
 - One `/sumup` every {COOLDOWN_SECONDS} seconds, {DAILY_LIMIT} a day (resets at midnight Eastern)
@@ -587,8 +718,9 @@ async def zone_autocomplete(interaction: discord.Interaction, current: str):
 async def forget(interaction: discord.Interaction):
     view = ForgetConfirm(interaction.user.id)
     await interaction.response.send_message(
-        "This deletes your time zone, default mode, and where each of your SumUps "
-        "left off in every channel. Your next SumUp will start fresh.\n"
+        "This deletes your time zone, default mode, where each of your SumUps "
+        "left off in every channel, and any recent summaries SumUp is holding for "
+        "Summarize again. Your next SumUp will start fresh.\n"
         "-# Your daily SumUp count isn't reset, so the daily limit stays fair.",
         view=view,
         ephemeral=True,
@@ -611,6 +743,7 @@ class ForgetConfirm(discord.ui.View):
     @discord.ui.button(label="Delete my data", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await state.forget_user(self.user_id)
+        forget_recent(self.user_id)
         self.stop()
         await interaction.response.edit_message(
             content="Done. Everything SumUp saved about you has been deleted.", view=None

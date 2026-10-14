@@ -469,3 +469,31 @@ A record of every step, decision, and concept in building SumUp, a Discord bot t
 - **Why 250:** about 6,000 tokens per chunk, small enough for close reading. Smaller chunks (10 or 100) split conversations into meaningless fragments, swamp the combine step with many notes, cost more in per-call overhead, and risk OpenAI's per-minute limits. 500 would be faster for 251–500 messages but reads less closely. It's one constant, to tune after testing with a long chat.
 - **Mid-conversation rule (every prompt):** the transcript may start partway through a conversation; if messages refer to something not shown, say earlier context is missing instead of guessing.
 - The OpenAI client timeout went from 30 to 60 seconds, since a combine call can follow the chunk calls.
+
+## Step 10: Summarize again (bringing back a dismissed summary)
+
+### The problem
+
+- Private ("ephemeral") replies disappear when dismissed or when Discord reloads.
+- Running `/sumup` again then said "You're all caught up!", because SumUp had already marked that channel as read. There was no way to get the summary back except guessing a `since` time.
+
+### What it does
+
+- When `/sumup` finds nothing new and there's a previous summary in that channel, the "all caught up" reply has a **🔁 Summarize again** button.
+- **Cache hit (within an hour, no restart):** the exact same summary comes back instantly, with Share and Switch buttons. Free.
+- **Cache miss:** SumUp re-reads the same messages and writes a fresh summary. Counts as one SumUp, and the cooldown applies.
+- Repeats are marked with a grey note: "A repeat of your last SumUp here."
+- A repeat doesn't move the "where you left off" point, since nothing new was read.
+
+### How it works
+
+- **New database column** `last_sumups.last_start_at`: the time of the oldest message the last summary covered. Together with `last_sumup_at` (when it ran), that's the exact range to re-read.
+  - Added with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, run at startup. Existing tables on Railway and in Docker upgrade themselves; older rows just have no start and get no button until the next summary.
+  - Re-reading asks Discord for messages after the start minus 1 millisecond (so the first message itself is included) and before the run time.
+- **"All caught up" no longer writes to the database.** Nothing new was read, so there's nothing to update, and writing would have overwritten the saved range.
+- **In-memory cache (`_recent`):** maps (user, channel) to (expiry time, the `SummaryRun`), which holds the transcript and any styles already written.
+  - **TTL (time to live):** entries expire after `CACHE_MINUTES = 60`. Expired entries are removed when read, and swept out whenever a new one is added.
+  - **Invalidation:** `/forget` clears the user's entries along with their database rows.
+  - **Why memory, not the database:** summaries contain conversation content. Keeping them only in memory, for at most an hour, keeps the "never stores message text" promise for the database.
+  - **Graceful fallback:** an empty cache (expired or restarted) quietly falls back to rewriting from the saved range.
+  - **Scaling limit:** an in-memory cache belongs to one process. If SumUp ran several copies, each would have its own cache and a user could hit the "wrong" one, so the next step would be a shared cache such as Redis.
